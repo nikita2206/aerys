@@ -19,6 +19,7 @@ use Aerys\{
     Middleware,
     Monitor,
     NullBody,
+    Parser,
     Request,
     Response,
     Server,
@@ -819,27 +820,13 @@ class Rfc6455Endpoint implements Endpoint, Middleware, Monitor, ServerObserver {
         $nextEmit = $emitThreshold;
         $dataArr = [];
 
-        $buffer = yield;
-        $offset = 0;
-        $bufferSize = \strlen($buffer);
-        $frames = 0;
+        $parser = new Parser(yield);
 
         while (1) {
-            if ($bufferSize < 2) {
-                $buffer = substr($buffer, $offset);
-                $offset = 0;
-                do {
-                    $buffer .= yield $frames;
-                    $bufferSize = \strlen($buffer);
-                    $frames = 0;
-                } while ($bufferSize < 2);
-            }
+            $twoBytes = yield from $parser->consumeN(2);
 
-            $firstByte = ord($buffer[$offset]);
-            $secondByte = ord($buffer[$offset + 1]);
-
-            $offset += 2;
-            $bufferSize -= 2;
+            $firstByte = ord($twoBytes[0]);
+            $secondByte = ord($twoBytes[1]);
 
             $fin = (bool)($firstByte & 0b10000000);
             // $rsv = ($firstByte & 0b01110000) >> 4; // unused (let's assume the bits are all zero)
@@ -854,33 +841,13 @@ class Rfc6455Endpoint implements Endpoint, Middleware, Monitor, ServerObserver {
             }
 
             if ($frameLength === 0x7E) {
-                if ($bufferSize < 2) {
-                    $buffer = substr($buffer, $offset);
-                    $offset = 0;
-                    do {
-                        $buffer .= yield $frames;
-                        $bufferSize = \strlen($buffer);
-                        $frames = 0;
-                    } while ($bufferSize < 2);
-                }
+                $twoBytes = yield from $parser->consumeN(2);
 
-                $frameLength = unpack('n', $buffer[$offset] . $buffer[$offset + 1])[1];
-                $offset += 2;
-                $bufferSize -= 2;
+                $frameLength = unpack('n', $twoBytes)[1];
             } elseif ($frameLength === 0x7F) {
-                if ($bufferSize < 8) {
-                    $buffer = substr($buffer, $offset);
-                    $offset = 0;
-                    do {
-                        $buffer .= yield $frames;
-                        $bufferSize = \strlen($buffer);
-                        $frames = 0;
-                    } while ($bufferSize < 8);
-                }
+                $eightBytes = yield from $parser->consumeN(8);
 
-                $lengthLong32Pair = unpack('N2', substr($buffer, $offset, 8));
-                $offset += 8;
-                $bufferSize -= 8;
+                $lengthLong32Pair = unpack('N2', $eightBytes);
 
                 if (PHP_INT_MAX === 0x7fffffff) {
                     if ($lengthLong32Pair[1] !== 0 || $lengthLong32Pair[2] < 0) {
@@ -937,36 +904,22 @@ class Rfc6455Endpoint implements Endpoint, Middleware, Monitor, ServerObserver {
             }
 
             if ($isMasked) {
-                if ($bufferSize < 4) {
-                    $buffer = substr($buffer, $offset);
-                    $offset = 0;
-                    do {
-                        $buffer .= yield $frames;
-                        $bufferSize = \strlen($buffer);
-                        $frames = 0;
-                    } while ($bufferSize < 4);
-                }
-
-                $maskingKey = substr($buffer, $offset, 4);
-                $offset += 4;
-                $bufferSize -= 4;
+                $maskingKey = yield from $parser->consumeN(4);
             }
 
-            if ($bufferSize >= $frameLength) {
+            if ($parser->isAvailableInBuffer($frameLength)) {
                 if (!$isControlFrame) {
                     $dataMsgBytesRecd += $frameLength;
                 }
 
-                $payload = substr($buffer, $offset, $frameLength);
-                $offset += $frameLength;
-                $bufferSize -= $frameLength;
+                $payload = $parser->consumeNFromBuffer($frameLength);
             } else {
                 if (!$isControlFrame) {
-                    $dataMsgBytesRecd += $bufferSize;
+                    $dataMsgBytesRecd += $parser->availableInBuffer();
                 }
-                $frameBytesRecd = $bufferSize;
+                $frameBytesRecd = $parser->availableInBuffer();
 
-                $payload = substr($buffer, $offset);
+                $payload = $parser->consumeWholeBuffer();
 
                 do {
                     // if we want to validate UTF8, we must *not* send incremental mid-frame updates because the message might be broken in the middle of an utf-8 sequence
@@ -1008,26 +961,21 @@ class Rfc6455Endpoint implements Endpoint, Middleware, Monitor, ServerObserver {
                         $frameBytesRecd = 0;
                     }
 
-                    $buffer = yield $frames;
-                    $bufferSize = \strlen($buffer);
-                    $frames = 0;
+                    yield from $parser->fetch();
 
-                    if ($bufferSize + $frameBytesRecd >= $frameLength) {
+                    if ($parser->availableInBuffer() + $frameBytesRecd >= $frameLength) {
                         $dataLen = $frameLength - $frameBytesRecd;
                     } else {
-                        $dataLen = $bufferSize;
+                        $dataLen = $parser->availableInBuffer();
                     }
 
                     if (!$isControlFrame) {
                         $dataMsgBytesRecd += $dataLen;
                     }
 
-                    $payload .= substr($buffer, 0, $dataLen);
+                    $payload .= $parser->consumeNFromBuffer($dataLen);
                     $frameBytesRecd += $dataLen;
                 } while ($frameBytesRecd != $frameLength);
-
-                $offset = $dataLen;
-                $bufferSize -= $dataLen;
             }
 
             if ($isMasked) {
@@ -1078,13 +1026,13 @@ class Rfc6455Endpoint implements Endpoint, Middleware, Monitor, ServerObserver {
                 $dataArr[] = $payload;
             }
 
-            $frames++;
+            $parser->advanceFrame();
         }
 
         // An error occurred...
         // stop parsing here ...
         $emitCallback([self::ERROR, $errorMsg, $code], $callbackData);
-        yield $frames;
+        yield $parser->frames();
         while (1) {
             yield 0;
         }
